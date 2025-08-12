@@ -1,2 +1,90 @@
-ibgda_submit_requests
+# 关键函数
+```bash
+void ibgda_submit_requests
+ibgda_post_send
+
+```
+
+
+# IBGDA的QP结构
+```c
+typedef struct nvshmemi_ibgda_device_qp {
+    int version;
+    nvshmemi_ibgda_device_qp_type_t qp_type;
+    uint32_t qpn;
+    uint32_t dev_idx;
+    struct {
+        uint32_t nslots;  // num slots for fetch; always a power of 2
+        void *buf;        // first NVSHMEMI_IBGDA_IBUF_SLOT_SIZE is for non-fetch
+        __be32 lkey;
+        __be32 rkey;
+    } ibuf;  // Internal buffer
+    struct {
+        uint16_t nwqes;  // num wqes; some wqes may consume n wqebbs
+        void *wqe;
+        __be32 *dbrec;
+        void *bf;
+        nvshmemi_ibgda_device_cq_t *cq;
+        // May point to mvars.prod_idx or internal prod_idx
+        uint64_t *prod_idx;
+    } tx_wq;
+    nvshmemi_ibgda_device_qp_management_v1 mvars;  // management variables
+} nvshmemi_ibgda_device_qp_v1;
+```
+
+
+# 敲DB关键实现
+```c
+    if (likely(new_prod_idx > old_prod_idx)) {
+        IBGDA_MEMBAR();
+        ibgda_update_dbr(qp, new_prod_idx);
+        IBGDA_MEMBAR();
+        ibgda_ring_db(qp, new_prod_idx);
+    }
+
+...
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_update_dbr(
+    nvshmemi_ibgda_device_qp_t *qp, uint32_t dbrec_head) {
+    // DBREC contains the index of the next empty WQEBB.
+    __be32 dbrec_val;
+    __be32 *dbrec_ptr = qp->tx_wq.dbrec;
+
+    // This is equivalent to
+    // WRITE_ONCE(dbrec_ptr, HTOBE32(dbrec_head & 0xffff));
+    asm volatile(
+        "{\n\t"
+        ".reg .b32 mask1;\n\t"
+        ".reg .b32 dbrec_head_16b;\n\t"
+        ".reg .b32 ign;\n\t"
+        ".reg .b32 mask2;\n\t"
+        "mov.b32 mask1, 0xffff;\n\t"
+        "mov.b32 mask2, 0x123;\n\t"
+        "and.b32 dbrec_head_16b, %1, mask1;\n\t"
+        "prmt.b32 %0, dbrec_head_16b, ign, mask2;\n\t"
+        "}"
+        : "=r"(dbrec_val)
+        : "r"(dbrec_head));
+    ibgda_store_release(dbrec_ptr, dbrec_val);
+}
+
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_ring_db(
+    nvshmemi_ibgda_device_qp_t *qp, uint16_t prod_idx) {
+    uint64_t *bf_ptr = (uint64_t *)qp->tx_wq.bf;
+    ibgda_ctrl_seg_t ctrl_seg = {.opmod_idx_opcode = HTOBE32(prod_idx << 8),
+                                 .qpn_ds = HTOBE32(qp->qpn << 8)};
+
+    ibgda_store_release(bf_ptr, *((uint64_t *)&ctrl_seg));
+}
+
+__device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void ibgda_store_release(uint64_t *ptr,
+                                                                                  uint64_t val) {
+#ifdef NVSHMEMI_IBGDA_PTX_OPTIMIZATION_STORE_RELEASE
+    asm volatile("st.release.gpu.global.L1::no_allocate.b64 [%0], %1;" : : "l"(ptr), "l"(val));
+#else
+    WRITE_ONCE(*ptr, val);
+#endif
+}
+```
+
+
 
